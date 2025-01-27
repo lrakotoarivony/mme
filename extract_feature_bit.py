@@ -7,6 +7,7 @@ import mmcv
 import numpy as np
 import torch
 import torchvision as tv
+import mmengine
 from tqdm import tqdm
 
 import resnetv2
@@ -40,7 +41,7 @@ def main():
     model.cuda().eval()
 
     if args.fc_save_path is not None:
-        mmcv.mkdir_or_exist(dirname(args.fc_save_path))
+        mmengine.mkdir_or_exist(dirname(args.fc_save_path))
         w = model.head.conv.weight.cpu().detach().squeeze().numpy()
         b = model.head.conv.bias.cpu().detach().squeeze().numpy()
         with open(args.fc_save_path, 'wb') as f:
@@ -74,8 +75,9 @@ def main():
             features.append(feat_batch)
 
     features = np.concatenate(features, axis=0)
+    features = np.squeeze(features)
 
-    mmcv.mkdir_or_exist(dirname(args.out_file))
+    mmengine.mkdir_or_exist(dirname(args.out_file))
     with open(args.out_file, 'wb') as f:
         pickle.dump(features, f)
 

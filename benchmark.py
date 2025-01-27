@@ -12,7 +12,13 @@ from sklearn import metrics
 from sklearn.covariance import EmpiricalCovariance
 from sklearn.metrics import pairwise_distances_argmin_min
 from tqdm import tqdm
+from scipy.spatial.distance import cdist
+import pickle
 
+EPSILON = 1e-8
+with open('datalists/mapping.pkl', 'rb') as handle:
+    mapping = pickle.load(handle)
+#mapping = 'datalists/mapping.pkl'
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Say hello')
@@ -102,12 +108,52 @@ def gradnorm(x, w, b):
 
     return np.array(confs)
 
+def softmax_temperature(x, axis=None, temperature=1.0):
+    x = x / temperature  # Apply temperature scaling
+    x_max = np.amax(x, axis=axis, keepdims=True)
+    exp_x_shifted = np.exp(x - x_max)
+    return exp_x_shifted / np.sum(exp_x_shifted, axis=axis, keepdims=True)
+
+    #score_ood = calculate_confidence_score(logit_ood_clip, distances_ood, beta = 0.0, gamma = 0.0) * (1.0 - r) / vlogit_ood
+
+
+def calculate_confidence_score(logits, distance, r, vlogits):
+    # Normalize logits to [0, 1]
+    #logits_ = np.max(logits, axis=1)
+    logits_ = logsumexp(logits, axis=-1)
+    
+    distance = softmax_temperature(distance, axis=1, temperature=0.5)
+    distance = 1 / distance
+    distance_ = np.max(distance, axis=1)
+
+    max_logits_indices = np.argmax(logits, axis=1)
+    map_func = np.vectorize(lambda x: mapping.get(x, None))  # Use `None` as default for missing keys
+    map_max_logits_indices = map_func(max_logits_indices)
+
+    max_distance_indices = np.argmax(distance, axis=1)
+
+    index_matches = (map_max_logits_indices == max_distance_indices).astype(float)
+    print(sum(index_matches) / len(index_matches))
+
+    index_matches_bool = (map_max_logits_indices == max_distance_indices)
+    index_matches_float = np.where(index_matches_bool, 0.5, 1.0)
+
+    #confidence_score = logits_ * distance_ * index_matches_float
+    #confidence_score = (logits_ * distance_ * index_matches_float) * (1 - r) / vlogits
+    #confidence_score = (logits_ - vlogits) * index_matches_float
+    #confidence_score = np.exp(logits_ - vlogits) * (1 - r)
+    #print(f'Similar prediction: {np.mean(confidence_score[index_matches_bool])}')
+    #print(f'Disimilar prediction: {np.mean(confidence_score[~index_matches_bool])}')
+
+    confidence_score = np.exp(logits_ - vlogits) * distance_ * index_matches_float * (1 - r)
+    return confidence_score
 
 # endregion
 
 
 def main():
     args = parse_args()
+    print(args)
 
     ood_names = [splitext(basename(ood))[0] for ood in args.ood_features]
     print(f'ood datasets: {ood_names}')
@@ -124,12 +170,22 @@ def main():
     recall = 0.95
 
     print('load features')
-    feature_id_train = mmengine.load(args.id_train_feature).squeeze()
-    feature_id_val = mmengine.load(args.id_val_feature).squeeze()
-    feature_oods = {
+    #feature_id_train = mmengine.load(args.id_train_feature).squeeze()
+    #feature_id_val = mmengine.load(args.id_val_feature).squeeze()
+
+    '''feature_oods = {
         name: mmengine.load(feat).squeeze()
         for name, feat in zip(ood_names, args.ood_features)
+    }'''
+
+    feature_id_train = mmengine.load(args.id_train_feature)
+    feature_id_val = mmengine.load(args.id_val_feature)
+
+    feature_oods = {
+        name: mmengine.load(feat)
+        for name, feat in zip(ood_names, args.ood_features)
     }
+
     print(f'{feature_id_train.shape=}, {feature_id_val.shape=}')
     for name, ood in feature_oods.items():
         print(f'{name} {ood.shape}')
@@ -137,6 +193,8 @@ def main():
     logit_id_train = feature_id_train @ w.T + b
     logit_id_val = feature_id_val @ w.T + b
     logit_oods = {name: feat @ w.T + b for name, feat in feature_oods.items()}
+
+    max_logits_indices = np.argmax(logit_id_val, axis=1)
 
     print('computing softmax...')
     softmax_id_train = softmax(logit_id_train, axis=-1)
@@ -224,6 +282,31 @@ def main():
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
+    method = 'Energy+VRA'
+    print(f'\n{method}')
+    result = []
+
+    clip_high = np.quantile(feature_id_train, 0.99)
+    clip_low = np.quantile(feature_id_train, 0.01)
+
+    print(f'clip quantile {args.clip_quantile}, clip {clip:.4f}')
+
+    logit_id_val_clip = np.clip(
+        feature_id_val, a_min=clip_low, a_max=clip_high) @ w.T + b
+    score_id = logsumexp(logit_id_val_clip, axis=-1)
+    for name, feature_ood in feature_oods.items():
+        logit_ood_clip = np.clip(feature_ood, a_min=clip_low, a_max=clip_high) @ w.T + b
+        score_ood = logsumexp(logit_ood_clip, axis=-1)
+        auc_ood = auc(score_id, score_ood)[0]
+        fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
+        result.append(
+            dict(method=method, oodset=name, auroc=auc_ood, fpr=fpr_ood))
+        print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
+    df = pd.DataFrame(result)
+    dfs.append(df)
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
+
+    # --------------------------------------
     method = 'ViM'
     print(f'\n{method}')
     result = []
@@ -266,7 +349,7 @@ def main():
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
-    method = 'Residual'
+    '''method = 'Residual'
     print(f'\n{method}')
     result = []
     if feature_id_val.shape[-1] >= 2048:
@@ -296,10 +379,10 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
-    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')'''
 
     # ---------------------------------------
-    method = 'GradNorm'
+    '''method = 'GradNorm'
     print(f'\n{method}')
     result = []
     score_id = gradnorm(feature_id_val, w, b)
@@ -351,10 +434,10 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
-    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')'''
 
     # ---------------------------------------
-    method = 'KL-Matching'
+    '''method = 'KL-Matching'
     print(f'\n{method}')
     result = []
 
@@ -371,6 +454,135 @@ def main():
     for name, softmax_ood in softmax_oods.items():
         score_ood = -pairwise_distances_argmin_min(
             softmax_ood, np.array(mean_softmax_train), metric=kl)[1]
+        auc_ood = auc(score_id, score_ood)[0]
+        fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
+        result.append(
+            dict(method=method, oodset=name, auroc=auc_ood, fpr=fpr_ood))
+        print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
+    df = pd.DataFrame(result)
+    dfs.append(df)
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')'''
+
+    # ---------------------------------------
+    '''method = 'PCA'
+    print(f'\n{method}')
+    result = []
+
+    feature_mean = np.mean(feature_id_train, axis=0)
+
+    threshold = np.quantile(feature_id_train, 0.92)
+    #threshold = 1.0
+
+    cov = np.cov(feature_id_train.T)
+    u_, s, v = np.linalg.svd(cov)
+
+    k = 256
+
+    M = u_[:, :k] @ u_[:, :k].T
+    dim = M.shape[0]
+
+    feature_id_val_clip = np.clip(feature_id_val, a_min=None, a_max=threshold)
+
+    logit_id_val = feature_id_val.clip(min=None, max=threshold) @ w.T + b
+    rec_norm = np.linalg.norm((feature_id_val - feature_mean) @ (np.identity(dim) - M), axis=-1)
+    r_id = rec_norm / np.linalg.norm(feature_id_val_clip, axis=-1)
+
+    score_id = logsumexp(logit_id_val, axis=-1) * (1.0 - r_id)
+
+
+    for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
+                                            feature_oods.values()):
+        feature_ood_clip = np.clip(feature_ood, a_min=None, a_max=threshold)
+        logit_ood_clip = feature_ood_clip @ w.T + b
+        rec_ood = np.linalg.norm((feature_ood_clip - feature_mean) @ (np.identity(dim) - M), axis=-1)
+        r_ood = rec_ood / np.linalg.norm(feature_ood_clip, axis=-1)
+        score_ood = logsumexp(logit_ood_clip, axis=-1) * (1.0 - r_ood)
+        auc_ood = auc(score_id, score_ood)[0]
+        fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
+        result.append(
+            dict(method=method, oodset=name, auroc=auc_ood, fpr=fpr_ood))
+        print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
+    df = pd.DataFrame(result)
+    dfs.append(df)
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')'''
+
+    # ---------------------------------------
+    method = 'Ours'
+    print(f'\n{method}')
+    result = []
+    #score_id = logit_id_val.max(axis=-1)
+    class_means = np.zeros((train_labels.max() + 1, feature_id_train.shape[1]))
+    for i in tqdm(range(train_labels.max() + 1)):
+        vectors = feature_id_train[train_labels == i]
+        vectors = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + EPSILON)).T
+        mean = np.mean(vectors, axis=0)
+        mean = mean / np.linalg.norm(mean)
+        class_means[i, :] = mean
+
+    
+    if feature_id_val.shape[-1] >= 2048:
+        DIM = 1000
+    elif feature_id_val.shape[-1] >= 768:
+        DIM = 512
+    else:
+        DIM = feature_id_val.shape[-1] // 2
+
+    ec = EmpiricalCovariance(assume_centered=True)
+    ec.fit(feature_id_train - u)
+    eig_vals, eigen_vectors = np.linalg.eig(ec.covariance_)
+    NS = np.ascontiguousarray(
+        (eigen_vectors.T[np.argsort(eig_vals * -1)[DIM:]]).T)
+
+    vlogit_id_train = norm(np.matmul(feature_id_train - u, NS), axis=-1)
+    alpha = logit_id_train.max(axis=-1).mean() / vlogit_id_train.mean()
+
+    vlogit_id_val = norm(np.matmul(feature_id_val - u, NS), axis=-1) * alpha
+    
+    feature_mean = np.mean(feature_id_train, axis=0)
+
+    cov = np.cov(feature_id_train.T)
+    u_, s, v = np.linalg.svd(cov)
+
+    k = 256
+
+    M = u_[:, :k] @ u_[:, :k].T
+    dim = M.shape[0]
+
+    rec_norm = np.linalg.norm((feature_id_val - feature_mean) @ (np.identity(dim) - M), axis=-1)
+    r_id = rec_norm / np.linalg.norm(feature_id_val, axis=-1)
+    
+    vectors_id = (feature_id_val.T / (np.linalg.norm(feature_id_val.T, axis=0) + EPSILON)).T
+
+    distances_id = cdist(class_means, vectors_id, "sqeuclidean")  # [nb_classes, N]
+    distances_id = distances_id.T
+
+    logit_id_val_clip = np.clip(feature_id_val, a_min=None, a_max=clip) @ w.T + b
+    #score_id = calculate_confidence_score(logit_id_val_clip, distances_id, r_id, vlogit_id_val)
+    score_id = calculate_confidence_score(logit_id_val, distances_id, r_id, vlogit_id_val)
+
+    #score_id = calculate_confidence_score(logit_id_val, distances_id, beta = 0.0, gamma = 0.0)
+    #score_id = logit_id_val.max(axis=-1)
+
+    for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
+                                            feature_oods.values()):
+        
+        vlogit_ood = norm(np.matmul(feature_ood - u, NS), axis=-1) * alpha
+
+        rec_norm = np.linalg.norm((feature_ood - feature_mean) @ (np.identity(dim) - M), axis=-1)
+        r_ood = rec_norm / np.linalg.norm(feature_ood, axis=-1)
+
+        vectors_ood = (feature_ood.T / (np.linalg.norm(feature_ood.T, axis=0) + EPSILON)).T
+
+        distances_ood = cdist(class_means, vectors_ood, "sqeuclidean")  # [nb_classes, N]
+        distances_ood = distances_ood.T
+
+        logit_ood_clip = np.clip(feature_ood, a_min=None, a_max=clip) @ w.T + b
+        #score_ood = calculate_confidence_score(logit_ood_clip, distances_ood, r_ood, vlogit_ood)
+        score_ood = calculate_confidence_score(logit_ood, distances_ood, r_ood, vlogit_ood)
+
+        #score_ood = calculate_confidence_score(logit_ood, distances_ood, beta = 0.0, gamma = 0.0)
+
+        #score_ood = logit_ood.max(axis=-1)
         auc_ood = auc(score_id, score_ood)[0]
         fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
         result.append(

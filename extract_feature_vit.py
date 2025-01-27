@@ -71,10 +71,12 @@ def main():
     with torch.no_grad():
         for x, _ in tqdm(dataloader):
             x = x.cuda()
-            feat_batch = model.backbone(x)[0][-1].cpu().numpy()
+            #feat_batch = model.backbone(x)[0][-1].cpu().numpy()
+            feat_batch = model.backbone(x)[0].cpu().numpy()
             features.append(feat_batch)
 
     features = np.concatenate(features, axis=0)
+    #features = np.stack(features)
 
     mmengine.mkdir_or_exist(dirname(args.out_file))
     with open(args.out_file, 'wb') as f:
