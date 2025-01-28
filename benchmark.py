@@ -16,8 +16,6 @@ from scipy.spatial.distance import cdist
 import pickle
 
 EPSILON = 1e-8
-with open('datalists/mapping.pkl', 'rb') as handle:
-    mapping = pickle.load(handle)
 #mapping = 'datalists/mapping.pkl'
 
 def parse_args():
@@ -117,25 +115,24 @@ def softmax_temperature(x, axis=None, temperature=1.0):
     #score_ood = calculate_confidence_score(logit_ood_clip, distances_ood, beta = 0.0, gamma = 0.0) * (1.0 - r) / vlogit_ood
 
 
-def calculate_confidence_score(logits, distance, r, vlogits):
+def calculate_confidence_score(logits, logits_clip, distance, r, vlogits, mapping = None):
     # Normalize logits to [0, 1]
     #logits_ = np.max(logits, axis=1)
     logits_ = logsumexp(logits, axis=-1)
+    max_logits_indices = np.argmax(logits, axis=1) 
+    if mapping is not None:
+        map_func = np.vectorize(lambda x: mapping.get(x, None))  # Use `None` as default for missing keys
+        max_logits_indices = map_func(max_logits_indices)
+
     
     distance = softmax_temperature(distance, axis=1, temperature=0.5)
     distance = 1 / distance
     distance_ = np.max(distance, axis=1)
-
-    max_logits_indices = np.argmax(logits, axis=1)
-    map_func = np.vectorize(lambda x: mapping.get(x, None))  # Use `None` as default for missing keys
-    map_max_logits_indices = map_func(max_logits_indices)
-
     max_distance_indices = np.argmax(distance, axis=1)
 
-    index_matches = (map_max_logits_indices == max_distance_indices).astype(float)
-    print(sum(index_matches) / len(index_matches))
-
-    index_matches_bool = (map_max_logits_indices == max_distance_indices)
+    index_matches = (max_logits_indices == max_distance_indices).astype(float)
+    #print(sum(index_matches) / len(index_matches))
+    index_matches_bool = (max_logits_indices == max_distance_indices)
     index_matches_float = np.where(index_matches_bool, 0.5, 1.0)
 
     #confidence_score = logits_ * distance_ * index_matches_float
@@ -158,6 +155,14 @@ def main():
     ood_names = [splitext(basename(ood))[0] for ood in args.ood_features]
     print(f'ood datasets: {ood_names}')
 
+    if 'imagenet' in args.id_val_feature:
+        with open('datalists/mapping.pkl', 'rb') as handle:
+            mapping = pickle.load(handle)
+    else:
+        mapping = None
+
+
+
     w, b = mmengine.load(args.fc)
     print(f'{w.shape=}, {b.shape=}')
 
@@ -170,13 +175,6 @@ def main():
     recall = 0.95
 
     print('load features')
-    #feature_id_train = mmengine.load(args.id_train_feature).squeeze()
-    #feature_id_val = mmengine.load(args.id_val_feature).squeeze()
-
-    '''feature_oods = {
-        name: mmengine.load(feat).squeeze()
-        for name, feat in zip(ood_names, args.ood_features)
-    }'''
 
     feature_id_train = mmengine.load(args.id_train_feature)
     feature_id_val = mmengine.load(args.id_val_feature)
@@ -379,10 +377,10 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
-    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')'''
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
-    '''method = 'GradNorm'
+    method = 'GradNorm'
     print(f'\n{method}')
     result = []
     score_id = gradnorm(feature_id_val, w, b)
@@ -395,10 +393,10 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
-    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')'''
 
     # ---------------------------------------
-    method = 'Mahalanobis'
+    '''method = 'Mahalanobis'
     print(f'\n{method}')
     result = []
 
@@ -434,10 +432,10 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
-    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')'''
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
-    '''method = 'KL-Matching'
+    method = 'KL-Matching'
     print(f'\n{method}')
     result = []
 
@@ -556,9 +554,9 @@ def main():
     distances_id = cdist(class_means, vectors_id, "sqeuclidean")  # [nb_classes, N]
     distances_id = distances_id.T
 
-    logit_id_val_clip = np.clip(feature_id_val, a_min=None, a_max=clip) @ w.T + b
+    logit_id_val_clip = np.clip(feature_id_val, a_min=clip_low, a_max=clip_high) @ w.T + b
     #score_id = calculate_confidence_score(logit_id_val_clip, distances_id, r_id, vlogit_id_val)
-    score_id = calculate_confidence_score(logit_id_val, distances_id, r_id, vlogit_id_val)
+    score_id = calculate_confidence_score(logit_id_val, logit_id_val_clip, distances_id, r_id, vlogit_id_val, mapping=mapping)
 
     #score_id = calculate_confidence_score(logit_id_val, distances_id, beta = 0.0, gamma = 0.0)
     #score_id = logit_id_val.max(axis=-1)
@@ -576,9 +574,9 @@ def main():
         distances_ood = cdist(class_means, vectors_ood, "sqeuclidean")  # [nb_classes, N]
         distances_ood = distances_ood.T
 
-        logit_ood_clip = np.clip(feature_ood, a_min=None, a_max=clip) @ w.T + b
+        logit_ood_clip = np.clip(feature_ood, a_min=clip_low, a_max=clip_high) @ w.T + b
         #score_ood = calculate_confidence_score(logit_ood_clip, distances_ood, r_ood, vlogit_ood)
-        score_ood = calculate_confidence_score(logit_ood, distances_ood, r_ood, vlogit_ood)
+        score_ood = calculate_confidence_score(logit_ood, logit_ood_clip, distances_ood, r_ood, vlogit_ood, mapping=mapping)
 
         #score_ood = calculate_confidence_score(logit_ood, distances_ood, beta = 0.0, gamma = 0.0)
 
