@@ -14,6 +14,8 @@ from sklearn.metrics import pairwise_distances_argmin_min
 from tqdm import tqdm
 from scipy.spatial.distance import cdist
 import pickle
+from copy import deepcopy
+import faiss
 
 EPSILON = 1e-8
 #mapping = 'datalists/mapping.pkl'
@@ -173,6 +175,28 @@ def she_distance(penultimate, target, metric='inner_product'):
         return dot_product / (norm_penultimate * norm_target)
     else:
         raise ValueError(f'Unknown metric: {metric}')
+
+
+def generalized_entropy(softmax_id_val, gamma=0.1, M=100):
+    probs = softmax_id_val
+    probs_sorted = np.sort(probs, axis=1)[:, -M:]
+    scores = np.sum(probs_sorted**gamma * (1 - probs_sorted)**gamma, axis=1)
+    
+    return -scores
+
+def knn_score(bankfeas, queryfeas, k=100, min=False):
+
+    bankfeas = deepcopy(np.array(bankfeas))
+    queryfeas = deepcopy(np.array(queryfeas))
+
+    index = faiss.IndexFlatIP(bankfeas.shape[-1])
+    index.add(bankfeas)
+    D, _ = index.search(queryfeas, k)
+    if min:
+        scores = np.array(D.min(axis=1))
+    else:
+        scores = np.array(D.mean(axis=1))
+    return scores
 
 def softmax_temperature(x, axis=None, temperature=1.0):
     x = x / temperature  # Apply temperature scaling
@@ -551,6 +575,62 @@ def main():
     for name, softmax_ood, feature_ood in zip(ood_names, softmax_oods.values(),
                                             feature_oods.values()):
         score_ood = she_distance(feature_ood, activation_log[np.argmax(softmax_ood, axis=-1)], metric)
+        auc_ood = auc(score_id, score_ood)[0]
+        fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
+        result.append(
+            dict(method=method, oodset=name, auroc=auc_ood, fpr=fpr_ood))
+        print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
+    df = pd.DataFrame(result)
+    dfs.append(df)
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
+
+    # ---------------------------------------
+    method = 'GEN'
+    print(f'\n{method}')
+    result = []
+
+    gamma_gen = 0.01
+    M_gen = 10
+    score_id = generalized_entropy(softmax_id_val, gamma_gen, M_gen)
+
+    for name, softmax_ood, feature_ood in zip(ood_names, softmax_oods.values(),
+                                            feature_oods.values()):
+        score_ood = generalized_entropy(softmax_ood, gamma_gen, M_gen)
+        auc_ood = auc(score_id, score_ood)[0]
+        fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
+        result.append(
+            dict(method=method, oodset=name, auroc=auc_ood, fpr=fpr_ood))
+        print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
+    df = pd.DataFrame(result)
+    dfs.append(df)
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
+
+    # ---------------------------------------
+    method = 'NNGuide'
+    print(f'\n{method}')
+    result = []
+
+    mask = np.zeros(feature_id_train.shape[0], dtype=bool)
+    mask[:600] = True
+    np.random.shuffle(mask)
+
+    normalizer = lambda x: x / np.linalg.norm(x, axis=-1, keepdims=True) + 1e-10
+    bank_feas = normalizer(feature_id_train[mask])
+    bank_logits = logit_id_train[mask]
+    bank_confs = logsumexp(bank_logits, axis=-1)
+    bank_guide = bank_feas * bank_confs[:, None]
+
+    feature_id_val_norm = normalizer(feature_id_val)
+    energy_id_val = logsumexp(logit_id_val, axis=-1)
+    conf_id_val = knn_score(bank_guide, feature_id_val_norm, k=100)
+    score_id = conf_id_val * energy_id_val
+
+    for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
+                                            feature_oods.values()):
+        feature_ood_norm = normalizer(feature_ood)
+        energy_ood = logsumexp(logit_ood, axis=-1)
+        conf_ood = knn_score(bank_guide, feature_ood_norm, k=100)
+        score_ood = conf_ood * energy_ood
         auc_ood = auc(score_id, score_ood)[0]
         fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
         result.append(
