@@ -106,6 +106,74 @@ def gradnorm(x, w, b):
 
     return np.array(confs)
 
+def ash_b(x, percentile=65):
+    assert x.dim() == 4
+    assert 0 <= percentile <= 100
+    b, c, h, w = x.shape
+
+    # calculate the sum of the input per sample
+    s1 = x.sum(dim=[1, 2, 3])
+
+    n = x.shape[1:].numel()
+    k = n - int(np.round(n * percentile / 100.0))
+    t = x.view((b, c * h * w))
+    v, i = torch.topk(t, k, dim=1)
+    fill = s1 / k
+    fill = fill.unsqueeze(dim=1).expand(v.shape)
+    t.zero_().scatter_(dim=1, index=i, src=fill)
+    return x
+
+
+def ash_p(x, percentile=65):
+    assert x.dim() == 4
+    assert 0 <= percentile <= 100
+
+    b, c, h, w = x.shape
+
+    n = x.shape[1:].numel()
+    k = n - int(np.round(n * percentile / 100.0))
+    t = x.view((b, c * h * w))
+    v, i = torch.topk(t, k, dim=1)
+    t.zero_().scatter_(dim=1, index=i, src=v)
+
+    return x
+
+
+def ash_s(x, percentile=65):
+    assert x.dim() == 4
+    assert 0 <= percentile <= 100
+    b, c, h, w = x.shape
+
+    # calculate the sum of the input per sample
+    s1 = x.sum(dim=[1, 2, 3])
+    n = x.shape[1:].numel()
+    k = n - int(np.round(n * percentile / 100.0))
+    t = x.view((b, c * h * w))
+    v, i = torch.topk(t, k, dim=1)
+    t.zero_().scatter_(dim=1, index=i, src=v)
+
+    # calculate new sum of the input per sample after pruning
+    s2 = x.sum(dim=[1, 2, 3])
+
+    # apply sharpening
+    scale = s1 / s2
+    x = x * torch.exp(scale[:, None, None, None])
+
+    return x
+
+def she_distance(penultimate, target, metric='inner_product'):
+    if metric == 'inner_product':
+        return np.sum(np.multiply(penultimate, target), axis=1)
+    elif metric == 'euclidean':
+        return -np.sqrt(np.sum((penultimate - target) ** 2, axis=1))
+    elif metric == 'cosine':
+        dot_product = np.sum(penultimate * target, axis=1)
+        norm_penultimate = np.linalg.norm(penultimate, axis=1)
+        norm_target = np.linalg.norm(target, axis=1)
+        return dot_product / (norm_penultimate * norm_target)
+    else:
+        raise ValueError(f'Unknown metric: {metric}')
+
 def softmax_temperature(x, axis=None, temperature=1.0):
     x = x / temperature  # Apply temperature scaling
     x_max = np.amax(x, axis=axis, keepdims=True)
@@ -125,7 +193,8 @@ def calculate_confidence_score(logits, logits_clip, distance, r, vlogits, mappin
         max_logits_indices = map_func(max_logits_indices)
 
     
-    distance = softmax_temperature(distance, axis=1, temperature=0.5)
+    #distance = softmax_temperature(distance, axis=1, temperature=0.5) #ViT
+    distance = softmax_temperature(distance, axis=1, temperature=0.1) #DenseNet
     distance = 1 / distance
     distance_ = np.max(distance, axis=1)
     max_distance_indices = np.argmax(distance, axis=1)
@@ -133,7 +202,8 @@ def calculate_confidence_score(logits, logits_clip, distance, r, vlogits, mappin
     index_matches = (max_logits_indices == max_distance_indices).astype(float)
     #print(sum(index_matches) / len(index_matches))
     index_matches_bool = (max_logits_indices == max_distance_indices)
-    index_matches_float = np.where(index_matches_bool, 0.5, 1.0)
+    index_matches_float = np.where(index_matches_bool, 1.0, 0.5) #Densenet
+    #index_matches_float = np.where(index_matches_bool, 0.5, 1.0) #ViT
 
     #confidence_score = logits_ * distance_ * index_matches_float
     #confidence_score = (logits_ * distance_ * index_matches_float) * (1 - r) / vlogits
@@ -143,6 +213,7 @@ def calculate_confidence_score(logits, logits_clip, distance, r, vlogits, mappin
     #print(f'Disimilar prediction: {np.mean(confidence_score[~index_matches_bool])}')
 
     confidence_score = np.exp(logits_ - vlogits) * distance_ * index_matches_float * (1 - r)
+    #confidence_score = np.exp(logits_ - vlogits) * distance_ * index_matches_float * (1 - r)
     return confidence_score
 
 # endregion
@@ -184,6 +255,30 @@ def main():
         for name, feat in zip(ood_names, args.ood_features)
     }
 
+    clip_high = np.quantile(feature_id_train, args.clip_quantile)
+    print(f'clip quantile high {args.clip_quantile}, clip {clip_high:.4f}')
+
+    clip_low = np.quantile(feature_id_train, 1 - args.clip_quantile)
+    print(f'clip quantile low {1 - args.clip_quantile}, clip {clip_low:.4f}')
+
+    # ---------------------------------------
+    # Introduced by Energy + React, used in PCA
+    feature_id_val_clip = np.clip(mmengine.load(args.id_val_feature), a_min=None, a_max=clip_high)
+    feature_oods_clip = {
+        name: np.clip(mmengine.load(feat), a_min=None, a_max=clip_high)
+        for name, feat in zip(ood_names, args.ood_features)
+    }
+    # ---------------------------------------
+
+    # ---------------------------------------
+    # Introduced by Energy + VRA
+    feature_id_val_clip_VRA = np.clip(mmengine.load(args.id_val_feature), a_min=clip_low, a_max=clip_high)
+    feature_oods_clip_VRA = {
+        name: np.clip(mmengine.load(feat), a_min=clip_low, a_max=clip_high)
+        for name, feat in zip(ood_names, args.ood_features)
+    }
+    # ---------------------------------------
+
     print(f'{feature_id_train.shape=}, {feature_id_val.shape=}')
     for name, ood in feature_oods.items():
         print(f'{name} {ood.shape}')
@@ -191,6 +286,13 @@ def main():
     logit_id_train = feature_id_train @ w.T + b
     logit_id_val = feature_id_val @ w.T + b
     logit_oods = {name: feat @ w.T + b for name, feat in feature_oods.items()}
+
+    logit_id_val_clip = feature_id_val_clip @ w.T + b
+    logit_oods_clip = {name: feat @ w.T + b for name, feat in feature_oods_clip.items()}
+
+    logit_id_val_clip_VRA = feature_id_val_clip_VRA @ w.T + b
+    logit_oods_clip_VRA = {name: feat @ w.T + b for name, feat in feature_oods_clip_VRA.items()}
+
 
     max_logits_indices = np.argmax(logit_id_val, axis=1)
 
@@ -202,7 +304,56 @@ def main():
         for name, logit in logit_oods.items()
     }
 
+    # ---------------------------------------
+    # Introduced by Residual, used in ViM and Ours
+    if feature_id_val.shape[-1] >= 2048:
+        DIM = 1000
+    elif feature_id_val.shape[-1] >= 768:
+        DIM = 512
+    else:
+        DIM = feature_id_val.shape[-1] // 2
+    print(f'{DIM=}')
+    
     u = -np.matmul(pinv(w), b)
+    print('computing principal space...')
+    ec = EmpiricalCovariance(assume_centered=True)
+    ec.fit(feature_id_train - u)
+    eig_vals, eigen_vectors = np.linalg.eig(ec.covariance_)
+    NS = np.ascontiguousarray(
+        (eigen_vectors.T[np.argsort(eig_vals * -1)[DIM:]]).T)
+    # ---------------------------------------
+
+    # ---------------------------------------
+    # Introduced by ViM, used in ours
+    print('computing alpha...')
+    vlogit_id_train = norm(np.matmul(feature_id_train - u, NS), axis=-1)
+    alpha = logit_id_train.max(axis=-1).mean() / vlogit_id_train.mean()
+    print(f'{alpha=:.4f}')
+    # ---------------------------------------
+
+    # ---------------------------------------
+    # Introduced by Ours, similar to Mahalanobis?
+    class_means = np.zeros((train_labels.max() + 1, feature_id_train.shape[1]))
+    for i in tqdm(range(train_labels.max() + 1)):
+        vectors = feature_id_train[train_labels == i]
+        vectors = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + EPSILON)).T
+        mean = np.mean(vectors, axis=0)
+        mean = mean / np.linalg.norm(mean)
+        class_means[i, :] = mean
+    # ---------------------------------------
+
+    # ---------------------------------------
+    # Introduced by PCA
+    feature_mean = np.mean(feature_id_train, axis=0)
+
+    cov = np.cov(feature_id_train.T)
+    u_, s, v = np.linalg.svd(cov)
+
+    k = 256
+
+    M = u_[:, :k] @ u_[:, :k].T
+    dim = M.shape[0]
+    # ---------------------------------------
 
     df = pd.DataFrame(columns=['method', 'oodset', 'auroc', 'fpr'])
 
@@ -261,14 +412,8 @@ def main():
     print(f'\n{method}')
     result = []
 
-    clip = np.quantile(feature_id_train, args.clip_quantile)
-    print(f'clip quantile {args.clip_quantile}, clip {clip:.4f}')
-
-    logit_id_val_clip = np.clip(
-        feature_id_val, a_min=None, a_max=clip) @ w.T + b
     score_id = logsumexp(logit_id_val_clip, axis=-1)
-    for name, feature_ood in feature_oods.items():
-        logit_ood_clip = np.clip(feature_ood, a_min=None, a_max=clip) @ w.T + b
+    for name, logit_ood_clip in logit_oods_clip.items():
         score_ood = logsumexp(logit_ood_clip, axis=-1)
         auc_ood = auc(score_id, score_ood)[0]
         fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
@@ -284,17 +429,9 @@ def main():
     print(f'\n{method}')
     result = []
 
-    clip_high = np.quantile(feature_id_train, 0.99)
-    clip_low = np.quantile(feature_id_train, 0.01)
-
-    print(f'clip quantile {args.clip_quantile}, clip {clip:.4f}')
-
-    logit_id_val_clip = np.clip(
-        feature_id_val, a_min=clip_low, a_max=clip_high) @ w.T + b
-    score_id = logsumexp(logit_id_val_clip, axis=-1)
-    for name, feature_ood in feature_oods.items():
-        logit_ood_clip = np.clip(feature_ood, a_min=clip_low, a_max=clip_high) @ w.T + b
-        score_ood = logsumexp(logit_ood_clip, axis=-1)
+    score_id = logsumexp(logit_id_val_clip_VRA, axis=-1)
+    for name, logit_ood_clip_VRA in logit_oods_clip_VRA.items():
+        score_ood = logsumexp(logit_ood_clip_VRA, axis=-1)
         auc_ood = auc(score_id, score_ood)[0]
         fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
         result.append(
@@ -308,25 +445,6 @@ def main():
     method = 'ViM'
     print(f'\n{method}')
     result = []
-    if feature_id_val.shape[-1] >= 2048:
-        DIM = 1000
-    elif feature_id_val.shape[-1] >= 768:
-        DIM = 512
-    else:
-        DIM = feature_id_val.shape[-1] // 2
-    print(f'{DIM=}')
-
-    print('computing principal space...')
-    ec = EmpiricalCovariance(assume_centered=True)
-    ec.fit(feature_id_train - u)
-    eig_vals, eigen_vectors = np.linalg.eig(ec.covariance_)
-    NS = np.ascontiguousarray(
-        (eigen_vectors.T[np.argsort(eig_vals * -1)[DIM:]]).T)
-
-    print('computing alpha...')
-    vlogit_id_train = norm(np.matmul(feature_id_train - u, NS), axis=-1)
-    alpha = logit_id_train.max(axis=-1).mean() / vlogit_id_train.mean()
-    print(f'{alpha=:.4f}')
 
     vlogit_id_val = norm(np.matmul(feature_id_val - u, NS), axis=-1) * alpha
     energy_id_val = logsumexp(logit_id_val, axis=-1)
@@ -347,26 +465,107 @@ def main():
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
+    method = 'DICE'
+    print(f'\n{method}')
+    result = []
+    
+    contrib = feature_mean[None, :] * w
+    thresh = np.percentile(contrib, 90)
+    mask = (contrib > thresh)
+    masked_w = w * mask
+
+    vote_id_val = feature_id_val[:, None, :] * masked_w  # Broadcasted multiplication (B, 1, C) * (F, C) -> (B, F, C)
+    output_id_val = np.sum(vote_id_val, axis=2) + b  # Summing along the last axis and adding fc_bias (B, F)
+    score_id = logsumexp(output_id_val, axis=-1)
+
+
+
+    for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
+                                            feature_oods.values()):
+        vote_ood = feature_ood[:, None, :] * masked_w  # Broadcasted multiplication (B, 1, C) * (F, C) -> (B, F, C)
+        output_ood = np.sum(vote_ood, axis=2) + b  # Summing along the last axis and adding fc_bias (B, F)
+        score_ood = logsumexp(output_ood, axis=-1)
+
+        auc_ood = auc(score_id, score_ood)[0]
+        fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
+        result.append(
+            dict(method=method, oodset=name, auroc=auc_ood, fpr=fpr_ood))
+        print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
+    df = pd.DataFrame(result)
+    dfs.append(df)
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
+
+    # ---------------------------------------
+    method = 'ASH'
+    print(f'\n{method}')
+    result = []
+    #refer to ash for hyperparameters p
+    percentile_ash = 95
+
+    feature_id_val_torch = torch.from_numpy(np.copy(feature_id_val))
+    feature_id_val_torch = ash_s(feature_id_val_torch.view(feature_id_val_torch.size(0), -1, 1, 1), percentile_ash)
+    feature_id_val_torch = feature_id_val_torch.view(feature_id_val_torch.size(0), -1)
+    feature_id_val_ash = feature_id_val_torch.cpu().detach().numpy()
+    logit_ash_id_val = feature_id_val_ash @ w.T + b
+    score_id = logsumexp(logit_ash_id_val, axis=-1)
+
+
+    for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
+                                            feature_oods.values()):
+        feature_ood_torch = torch.from_numpy(np.copy(feature_ood))
+        feature_ood_torch = ash_s(feature_ood_torch.view(feature_ood_torch.size(0), -1, 1, 1), percentile_ash)
+        feature_ood_torch = feature_ood_torch.view(feature_ood_torch.size(0), -1)
+        feature_ood_ash = feature_ood_torch.cpu().detach().numpy()
+        logit_ash_ood = feature_ood_ash @ w.T + b
+        score_ood = logsumexp(logit_ash_ood, axis=-1)
+
+        auc_ood = auc(score_id, score_ood)[0]
+        fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
+        result.append(
+            dict(method=method, oodset=name, auroc=auc_ood, fpr=fpr_ood))
+        print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
+    df = pd.DataFrame(result)
+    dfs.append(df)
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
+
+    # ---------------------------------------
+    method = 'SHE'
+    print(f'\n{method}')
+    result = []
+    
+    metric = 'inner_product'
+    pred_labels_train = np.argmax(softmax_id_train, axis=-1)
+
+    activation_log = []
+    for i in range(train_labels.max() + 1):
+        mask = (train_labels == i) & (pred_labels_train == i)
+        class_correct_activations = feature_id_train[mask]
+        activation_log.append(np.mean(class_correct_activations, axis=0))
+
+    activation_log = np.stack(activation_log, axis=0)
+    #activation_log = torch.cat(self.activation_log).cuda()
+
+    score_id = she_distance(feature_id_val, activation_log[np.argmax(softmax_id_val, axis=-1)], metric)
+
+
+    for name, softmax_ood, feature_ood in zip(ood_names, softmax_oods.values(),
+                                            feature_oods.values()):
+        score_ood = she_distance(feature_ood, activation_log[np.argmax(softmax_ood, axis=-1)], metric)
+        auc_ood = auc(score_id, score_ood)[0]
+        fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
+        result.append(
+            dict(method=method, oodset=name, auroc=auc_ood, fpr=fpr_ood))
+        print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
+    df = pd.DataFrame(result)
+    dfs.append(df)
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
+
+    # ---------------------------------------
     '''method = 'Residual'
     print(f'\n{method}')
     result = []
-    if feature_id_val.shape[-1] >= 2048:
-        DIM = 1000
-    elif feature_id_val.shape[-1] >= 768:
-        DIM = 512
-    else:
-        DIM = feature_id_val.shape[-1] // 2
-    print(f'{DIM=}')
-
-    print('computing principal space...')
-    ec = EmpiricalCovariance(assume_centered=True)
-    ec.fit(feature_id_train - u)
-    eig_vals, eigen_vectors = np.linalg.eig(ec.covariance_)
-    NS = np.ascontiguousarray(
-        (eigen_vectors.T[np.argsort(eig_vals * -1)[DIM:]]).T)
 
     score_id = -norm(np.matmul(feature_id_val - u, NS), axis=-1)
-
     for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
                                             feature_oods.values()):
         score_ood = -norm(np.matmul(feature_ood - u, NS), axis=-1)
@@ -396,7 +595,7 @@ def main():
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')'''
 
     # ---------------------------------------
-    '''method = 'Mahalanobis'
+    '''method = 'Mahalanobis' #to factorise if necessary
     print(f'\n{method}')
     result = []
 
@@ -435,7 +634,7 @@ def main():
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
-    method = 'KL-Matching'
+    method = 'KL-Matching' #to factorise if necessary
     print(f'\n{method}')
     result = []
 
@@ -462,7 +661,7 @@ def main():
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')'''
 
     # ---------------------------------------
-    '''method = 'PCA'
+    '''method = 'PCA' #to factorise if necessary
     print(f'\n{method}')
     result = []
 
@@ -508,45 +707,12 @@ def main():
     method = 'Ours'
     print(f'\n{method}')
     result = []
-    #score_id = logit_id_val.max(axis=-1)
-    class_means = np.zeros((train_labels.max() + 1, feature_id_train.shape[1]))
-    for i in tqdm(range(train_labels.max() + 1)):
-        vectors = feature_id_train[train_labels == i]
-        vectors = (vectors.T / (np.linalg.norm(vectors.T, axis=0) + EPSILON)).T
-        mean = np.mean(vectors, axis=0)
-        mean = mean / np.linalg.norm(mean)
-        class_means[i, :] = mean
-
-    
-    if feature_id_val.shape[-1] >= 2048:
-        DIM = 1000
-    elif feature_id_val.shape[-1] >= 768:
-        DIM = 512
-    else:
-        DIM = feature_id_val.shape[-1] // 2
-
-    ec = EmpiricalCovariance(assume_centered=True)
-    ec.fit(feature_id_train - u)
-    eig_vals, eigen_vectors = np.linalg.eig(ec.covariance_)
-    NS = np.ascontiguousarray(
-        (eigen_vectors.T[np.argsort(eig_vals * -1)[DIM:]]).T)
-
-    vlogit_id_train = norm(np.matmul(feature_id_train - u, NS), axis=-1)
-    alpha = logit_id_train.max(axis=-1).mean() / vlogit_id_train.mean()
 
     vlogit_id_val = norm(np.matmul(feature_id_val - u, NS), axis=-1) * alpha
-    
-    feature_mean = np.mean(feature_id_train, axis=0)
-
-    cov = np.cov(feature_id_train.T)
-    u_, s, v = np.linalg.svd(cov)
-
-    k = 256
-
-    M = u_[:, :k] @ u_[:, :k].T
-    dim = M.shape[0]
 
     rec_norm = np.linalg.norm((feature_id_val - feature_mean) @ (np.identity(dim) - M), axis=-1)
+    #s = (feature_id_val - feature_mean)
+    #t = (np.identity(dim) - M)
     r_id = rec_norm / np.linalg.norm(feature_id_val, axis=-1)
     
     vectors_id = (feature_id_val.T / (np.linalg.norm(feature_id_val.T, axis=0) + EPSILON)).T
@@ -557,9 +723,6 @@ def main():
     logit_id_val_clip = np.clip(feature_id_val, a_min=clip_low, a_max=clip_high) @ w.T + b
     #score_id = calculate_confidence_score(logit_id_val_clip, distances_id, r_id, vlogit_id_val)
     score_id = calculate_confidence_score(logit_id_val, logit_id_val_clip, distances_id, r_id, vlogit_id_val, mapping=mapping)
-
-    #score_id = calculate_confidence_score(logit_id_val, distances_id, beta = 0.0, gamma = 0.0)
-    #score_id = logit_id_val.max(axis=-1)
 
     for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
                                             feature_oods.values()):
@@ -578,9 +741,6 @@ def main():
         #score_ood = calculate_confidence_score(logit_ood_clip, distances_ood, r_ood, vlogit_ood)
         score_ood = calculate_confidence_score(logit_ood, logit_ood_clip, distances_ood, r_ood, vlogit_ood, mapping=mapping)
 
-        #score_ood = calculate_confidence_score(logit_ood, distances_ood, beta = 0.0, gamma = 0.0)
-
-        #score_ood = logit_ood.max(axis=-1)
         auc_ood = auc(score_id, score_ood)[0]
         fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
         result.append(
