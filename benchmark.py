@@ -163,6 +163,28 @@ def ash_s(x, percentile=65):
 
     return x
 
+def scale(x, percentile=65):
+    input = x.clone()
+    assert x.dim() == 4
+    assert 0 <= percentile <= 100
+    b, c, h, w = x.shape
+
+    # calculate the sum of the input per sample
+    s1 = x.sum(dim=[1, 2, 3])
+    n = x.shape[1:].numel()
+    k = n - int(np.round(n * percentile / 100.0))
+    t = x.view((b, c * h * w))
+    v, i = torch.topk(t, k, dim=1)
+    t.zero_().scatter_(dim=1, index=i, src=v)
+
+    # calculate new sum of the input per sample after pruning
+    s2 = x.sum(dim=[1, 2, 3])
+
+    # apply sharpening
+    scale = s1 / s2
+
+    return input * torch.exp(scale[:, None, None, None])
+
 def she_distance(penultimate, target, metric='inner_product'):
     if metric == 'inner_product':
         return np.sum(np.multiply(penultimate, target), axis=1)
@@ -502,8 +524,6 @@ def main():
     output_id_val = np.sum(vote_id_val, axis=2) + b  # Summing along the last axis and adding fc_bias (B, F)
     score_id = logsumexp(output_id_val, axis=-1)
 
-
-
     for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
                                             feature_oods.values()):
         vote_ood = feature_ood[:, None, :] * masked_w  # Broadcasted multiplication (B, 1, C) * (F, C) -> (B, F, C)
@@ -631,6 +651,70 @@ def main():
         energy_ood = logsumexp(logit_ood, axis=-1)
         conf_ood = knn_score(bank_guide, feature_ood_norm, k=100)
         score_ood = conf_ood * energy_ood
+        auc_ood = auc(score_id, score_ood)[0]
+        fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
+        result.append(
+            dict(method=method, oodset=name, auroc=auc_ood, fpr=fpr_ood))
+        print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
+    df = pd.DataFrame(result)
+    dfs.append(df)
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
+
+    # ---------------------------------------
+    method = 'SCALE'
+    print(f'\n{method}')
+    result = []
+    
+    percentile_scale = 85
+
+    feature_id_val_torch = torch.from_numpy(np.copy(feature_id_val))
+    feature_id_val_torch = scale(feature_id_val_torch.view(feature_id_val_torch.size(0), -1, 1, 1), percentile_scale)
+    feature_id_val_torch = feature_id_val_torch.view(feature_id_val_torch.size(0), -1)
+    feature_id_val_scale = feature_id_val_torch.cpu().detach().numpy()
+    logit_scale_id_val = feature_id_val_scale @ w.T + b
+    score_id = logsumexp(logit_scale_id_val, axis=-1)
+
+
+    for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
+                                            feature_oods.values()):
+        feature_ood_torch = torch.from_numpy(np.copy(feature_ood))
+        feature_ood_torch = scale(feature_ood_torch.view(feature_ood_torch.size(0), -1, 1, 1), percentile_scale)
+        feature_ood_torch = feature_ood_torch.view(feature_ood_torch.size(0), -1)
+        feature_ood_scale = feature_ood_torch.cpu().detach().numpy()
+        logit_scale_ood = feature_ood_scale @ w.T + b
+        score_ood = logsumexp(logit_scale_ood, axis=-1)
+
+        auc_ood = auc(score_id, score_ood)[0]
+        fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
+        result.append(
+            dict(method=method, oodset=name, auroc=auc_ood, fpr=fpr_ood))
+        print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
+    df = pd.DataFrame(result)
+    dfs.append(df)
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
+
+    # ---------------------------------------
+    method = 'FDBD'
+    print(f'\n{method}')
+    result = []
+
+    num_classes = train_labels.max() + 1
+    denominator_matrix = np.zeros((num_classes, num_classes))
+    for p in range(num_classes):
+        w_p = w - w[p, :]
+        denominator = np.linalg.norm(w_p, axis=1)
+        denominator[p] = 1
+        denominator_matrix[p, :] = denominator
+    
+    nn_idx_id_val = logit_id_val.argmax(axis=-1)
+    logits_id_val_sub = np.abs(logit_id_val - np.max(logit_id_val, axis=-1, keepdims=True))
+    score_id = np.sum(logits_id_val_sub / denominator_matrix[nn_idx_id_val], axis=1) / np.linalg.norm(feature_id_val - feature_mean, axis=1)
+
+    for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
+                                            feature_oods.values()):
+        nn_idx_ood = logit_ood.argmax(axis=-1)
+        logits_ood_sub = np.abs(logit_ood - np.max(logit_ood, axis=-1, keepdims=True))
+        score_ood = np.sum(logits_ood_sub / denominator_matrix[nn_idx_ood], axis=1) / np.linalg.norm(feature_ood - feature_mean, axis=1)
         auc_ood = auc(score_id, score_ood)[0]
         fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
         result.append(
@@ -801,8 +885,20 @@ def main():
     distances_id = distances_id.T
 
     logit_id_val_clip = np.clip(feature_id_val, a_min=clip_low, a_max=clip_high) @ w.T + b
+
+    contrib = feature_mean[None, :] * w
+    thresh = np.percentile(contrib, 90)
+    mask = (contrib > thresh)
+    masked_w = w * mask
+
+    vote_id_val = feature_id_val[:, None, :] * masked_w  # Broadcasted multiplication (B, 1, C) * (F, C) -> (B, F, C)
+    output_id_val = np.sum(vote_id_val, axis=2) + b  # Summing along the last axis and adding fc_bias (B, F)
+    #score_id = logsumexp(output_id_val, axis=-1)
+
     #score_id = calculate_confidence_score(logit_id_val_clip, distances_id, r_id, vlogit_id_val)
-    score_id = calculate_confidence_score(logit_id_val, logit_id_val_clip, distances_id, r_id, vlogit_id_val, mapping=mapping)
+    score_id = calculate_confidence_score(logit_id_val, logit_id_val_clip, distances_id, r_id, vlogit_id_val, mapping=mapping) #reference
+    #score_id = calculate_confidence_score(output_id_val, logit_id_val_clip, distances_id, r_id, vlogit_id_val, mapping=mapping)
+
 
     for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
                                             feature_oods.values()):
@@ -819,7 +915,12 @@ def main():
 
         logit_ood_clip = np.clip(feature_ood, a_min=clip_low, a_max=clip_high) @ w.T + b
         #score_ood = calculate_confidence_score(logit_ood_clip, distances_ood, r_ood, vlogit_ood)
-        score_ood = calculate_confidence_score(logit_ood, logit_ood_clip, distances_ood, r_ood, vlogit_ood, mapping=mapping)
+
+        vote_ood = feature_ood[:, None, :] * masked_w  # Broadcasted multiplication (B, 1, C) * (F, C) -> (B, F, C)
+        output_ood = np.sum(vote_ood, axis=2) + b
+
+        score_ood = calculate_confidence_score(logit_ood, logit_ood_clip, distances_ood, r_ood, vlogit_ood, mapping=mapping) # reference
+        #score_ood = calculate_confidence_score(output_ood, logit_ood_clip, distances_ood, r_ood, vlogit_ood, mapping=mapping)
 
         auc_ood = auc(score_id, score_ood)[0]
         fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
