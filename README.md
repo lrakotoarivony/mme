@@ -1,8 +1,13 @@
-# Code for MME: Multi-Method Ensemble for Out-Of-Distribution
+## Multi-Method Ensemble for Out-of-Distribution Detection
+The official implementation of our ACIVS 2025 paper:
+[Multi-Method Ensemble for Out-of-Distribution Detection](https://arxiv.org/abs/2508.21463).
 
-Supplementary material such as proof, dataset description and ablation study is available in the appendix of the file ICCV_MME_Supp.pdf
+#### Abstract
+*Detecting out-of-distribution (OOD) samples is essential for neural networks operating in open-world settings, particularly in safety-critical applications. Existing methods have improved OOD detection by leveraging two main techniques: feature truncation, which increases the separation between in-distribution (ID) and OOD samples, and scoring functions, which assign scores to distinguish between ID and OOD data. However, most approaches either focus on a single family of techniques or evaluate their effectiveness on a specific type of OOD dataset, overlooking the potential of combining multiple existing solutions. Motivated by this observation, we theoretically and empirically demonstrate that state-of-the-art feature truncation and scoring functions can be effectively combined. Moreover, we show that aggregating multiple scoring functions enhances robustness against various types of OOD samples. Based on these insights, we propose the Multi-Method Ensemble (MME) score, which unifies state-of-the-art OOD detectors into a single, more effective scoring function. Extensive experiments on both large-scale and small-scale benchmarks, covering near-OOD and far-OOD scenarios, show that MME significantly outperforms recent state-of-the-art methods across all benchmarks. Notably, using the BiT model, our method achieves an average FPR95 of 27.57% on the challenging ImageNet-1K benchmark, improving performance by 6% over the best existing baseline.*
 
-## DataSets
+<img src="overview.png" alt="drawing">
+
+### DataSets
 
 Dataset source can be downloaded here.
 
@@ -25,9 +30,9 @@ ln -s /path/to/imagenet_o imagenet_o
 cd ..
 ```
 
-## Pretrained Model Preparation
+### Pretrained Model Preparation
 
-### VIT
+#### VIT
 
 1. install mmpretrain
 2. download checkpoint
@@ -58,7 +63,7 @@ cd ..
    ./benchmark.py outputs/vit_fc.pkl outputs/vit_cifar10_train.pkl outputs/vit_cifar10_test.pkl outputs/vit_openimage_o.pkl outputs/vit_texture.pkl outputs/vit_inaturalist.pkl outputs/vit_imagenet_o.pkl
    ```
 
-### BIT
+#### BIT
 
 1. download checkpoint
    ```bash
@@ -85,9 +90,13 @@ cd ..
    ./benchmark.py outputs/bit_fc.pkl outputs/bit_train_200k.pkl outputs/bit_imagenet_val.pkl outputs/bit_openimage_o.pkl outputs/bit_texture.pkl outputs/bit_inaturalist.pkl outputs/bit_imagenet_o.pkl
    ```
 
-## Acknowledgement
+### Results
+<img src="overview.png" alt="drawing">
+   
+### Cite
+If you found this work useful in your research, please consider citing:
 
-Part of the code is highly inspired from [ViM](https://github.com/haoqiwang/vim) repo.
-Part of the code is inspired from [OpenOOD](https://github.com/Jingkang50/OpenOOD) repo.
 
-Part of the code is modified from [MOS](https://github.com/deeplearning-wisc/large_scale_ood) repo.
+### Acknowledgement
+
+Part of the code is highly inspired from [ViM](https://github.com/haoqiwang/vim) repo. Part of the code is inspired from [OpenOOD](https://github.com/Jingkang50/OpenOOD) and [MOS](https://github.com/deeplearning-wisc/large_scale_ood) repo.
