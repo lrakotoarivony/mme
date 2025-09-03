@@ -91,7 +91,7 @@ cd ..
    ```
 
 ### Results
-<img src="overview.png" alt="drawing">
+<img src="result.png" alt="drawing">
    
 ### Cite
 If you found this work useful in your research, please consider citing:
