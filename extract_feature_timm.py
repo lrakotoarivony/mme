@@ -9,6 +9,11 @@ import timm
 import torch
 import torchvision as tv
 from tqdm import tqdm
+import mmengine
+
+#import torchvision.models as models
+#from torchvision.models import resnet50
+from resnet import resnet50
 
 from list_dataset import ImageFilelist
 
@@ -37,8 +42,9 @@ def main():
     torch.backends.cudnn.benchmark = True
 
     if args.fc_save_path is not None:
-        model = timm.create_model(args.model, pretrained=True)
-        mmcv.mkdir_or_exist(dirname(args.fc_save_path))
+        #model = timm.create_model(args.model, pretrained=True)
+        model = resnet50(pretrained=True)
+        mmengine.mkdir_or_exist(dirname(args.fc_save_path))
         if args.model in ['repvgg_b3']:
             w = model.head.fc.weight.cpu().detach().numpy()
             b = model.head.fc.bias.cpu().detach().numpy()
@@ -54,8 +60,11 @@ def main():
             pickle.dump([w, b], f)
         return
 
-    model = timm.create_model(
-        args.model, pretrained=True, num_classes=0).cuda().eval()
+    #model = timm.create_model(
+        #args.model, pretrained=True, num_classes=0).cuda().eval()
+    
+    model = resnet50(pretrained=True)
+    model = model.cuda().eval()
 
     transform = tv.transforms.Compose([
         tv.transforms.Resize((224, 224)),
@@ -80,12 +89,13 @@ def main():
     with torch.no_grad():
         for x, _ in tqdm(dataloader):
             x = x.cuda()
-            feat_batch = model(x).cpu().numpy()
+            _, feat_batch = model(x)
+            feat_batch = feat_batch.cpu().numpy()
             features.append(feat_batch)
 
     features = np.concatenate(features, axis=0)
 
-    mmcv.mkdir_or_exist(dirname(args.out_file))
+    mmengine.mkdir_or_exist(dirname(args.out_file))
     with open(args.out_file, 'wb') as f:
         pickle.dump(features, f)
 

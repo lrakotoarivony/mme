@@ -45,13 +45,7 @@ def main():
         else:
             pretrained_model = 'checkpoints/densenet100.pth'
             model = DenseNet3(100, 100)
-    else:      
-        if args.ind == 'cifar10':
-            pretrained_model = 'checkpoints/wideresnet10.pth'
-            model = WideResNet(34, 10)
-        else:
-            pretrained_model = 'checkpoints/wideresnet100.pth'
-            model = WideResNet(34, 100)
+
     
     transform = transforms.Compose([transforms.Resize(32),
             transforms.CenterCrop(32), 
@@ -101,38 +95,6 @@ def main():
     with open(args.out_file, 'wb') as f:
         pickle.dump(features, f)
 
-    '''if args.ind == 'cifar10':
-        test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, 
-                                                download=True, transform=transform)
-    else:
-        test_dataset = torchvision.datasets.CIFAR100(root='./data', train=False, 
-                                                download=True, transform=transform)
-
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=64, shuffle=False)
-    device = 'cuda'
-
-    def evaluate_model():
-        correct = 0
-        total = 0
-
-        with torch.no_grad():  # No need to compute gradients during evaluation
-            for inputs, labels in test_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-                
-                # Forward pass
-                outputs = model(inputs)
-                
-                # Calculate accuracy
-                _, predicted = torch.max(outputs.data, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
-        
-        accuracy = 100 * correct / total
-        return accuracy
-
-    # Step 5: Print the evaluation results
-    accuracy = evaluate_model()
-    print(f"Test Accuracy: {accuracy:.2f}%")'''
 
 
 if __name__ == '__main__':

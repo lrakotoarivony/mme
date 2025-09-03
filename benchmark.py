@@ -16,6 +16,8 @@ from scipy.spatial.distance import cdist
 import pickle
 from copy import deepcopy
 import faiss
+from mpmath import exp
+import time
 
 EPSILON = 1e-8
 #mapping = 'datalists/mapping.pkl'
@@ -57,6 +59,23 @@ def fpr_recall(ind_conf, ood_conf, tpr):
     fpr = num_fp / max(1, num_ood)
     return fpr, thresh
 
+def near_far_mean(result, list_near_ood, list_far_ood):
+    far_ood_result = [entry for entry in result if any(far in entry["oodset"] for far in list_far_ood)]
+    far_ood_auroc = 0
+    far_ood_fpr = 0
+    for entry in far_ood_result:
+        far_ood_auroc += entry['auroc']
+        far_ood_fpr += entry['fpr']
+
+    near_ood_result = [entry for entry in result if any(near in entry["oodset"] for near in list_near_ood)]
+    near_ood_auroc = 0
+    near_ood_fpr = 0
+    for entry in near_ood_result:
+        near_ood_auroc += entry['auroc']
+        near_ood_fpr += entry['fpr']
+
+    return near_ood_auroc / len(list_near_ood), near_ood_fpr / len(list_near_ood), far_ood_auroc / len(list_far_ood), far_ood_fpr / len(list_far_ood)
+
 
 def auc(ind_conf, ood_conf):
     conf = np.concatenate((ind_conf, ood_conf))
@@ -78,11 +97,6 @@ def auc(ind_conf, ood_conf):
 
 def kl(p, q):
     return np.sum(np.where(p != 0, p * np.log(p / q), 0))
-
-
-# endregion
-
-# region OOD
 
 
 def gradnorm(x, w, b):
@@ -226,43 +240,35 @@ def softmax_temperature(x, axis=None, temperature=1.0):
     exp_x_shifted = np.exp(x - x_max)
     return exp_x_shifted / np.sum(exp_x_shifted, axis=axis, keepdims=True)
 
-    #score_ood = calculate_confidence_score(logit_ood_clip, distances_ood, beta = 0.0, gamma = 0.0) * (1.0 - r) / vlogit_ood
 
-
-def calculate_confidence_score(logits, logits_clip, distance, r, vlogits, mapping = None):
-    # Normalize logits to [0, 1]
-    #logits_ = np.max(logits, axis=1)
+def mme(logits, distance, r, vlogits, fdbd, mapping = None, plus = True):
     logits_ = logsumexp(logits, axis=-1)
-    max_logits_indices = np.argmax(logits, axis=1) 
+    max_logits_indices = np.argmax(logits, axis=1)
+    temperature = 0.1
     if mapping is not None:
-        map_func = np.vectorize(lambda x: mapping.get(x, None))  # Use `None` as default for missing keys
+        map_func = np.vectorize(lambda x: mapping.get(x, None))
         max_logits_indices = map_func(max_logits_indices)
+        temperature = 0.5
 
-    
-    #distance = softmax_temperature(distance, axis=1, temperature=0.5) #ViT
-    distance = softmax_temperature(distance, axis=1, temperature=0.1) #DenseNet
+    distance = softmax_temperature(distance, axis=1, temperature=temperature)
     distance = 1 / distance
     distance_ = np.max(distance, axis=1)
     max_distance_indices = np.argmax(distance, axis=1)
 
-    index_matches = (max_logits_indices == max_distance_indices).astype(float)
-    #print(sum(index_matches) / len(index_matches))
     index_matches_bool = (max_logits_indices == max_distance_indices)
-    index_matches_float = np.where(index_matches_bool, 1.0, 0.5) #Densenet
-    #index_matches_float = np.where(index_matches_bool, 0.5, 1.0) #ViT
+    if mapping is not None:
+        index_matches_float = np.where(index_matches_bool, 0.5, 1.0)
+    else:
+        index_matches_float = np.where(index_matches_bool, 2.0, 1.0)
 
-    #confidence_score = logits_ * distance_ * index_matches_float
-    #confidence_score = (logits_ * distance_ * index_matches_float) * (1 - r) / vlogits
-    #confidence_score = (logits_ - vlogits) * index_matches_float
-    #confidence_score = np.exp(logits_ - vlogits) * (1 - r)
-    #print(f'Similar prediction: {np.mean(confidence_score[index_matches_bool])}')
-    #print(f'Disimilar prediction: {np.mean(confidence_score[~index_matches_bool])}')
-
-    confidence_score = np.exp(logits_ - vlogits) * distance_ * index_matches_float * (1 - r)
-    #confidence_score = np.exp(logits_ - vlogits) * distance_ * index_matches_float * (1 - r)
+    if plus:
+        confidence_score = np.exp(logits_ - vlogits) * distance_ * index_matches_float * (1 - r) * fdbd
+    else:
+        confidence_score = np.exp(logits_ - vlogits) * distance_ * index_matches_float * fdbd
+    
+    max_float = np.finfo(confidence_score.dtype).max #just for numerical stabilities
+    confidence_score[confidence_score == np.inf] = max_float
     return confidence_score
-
-# endregion
 
 
 def main():
@@ -278,7 +284,8 @@ def main():
     else:
         mapping = None
 
-
+    list_far_ood = ['inaturalist', 'texture', 'openimage']
+    list_near_ood = ['ssb', 'ninco']
 
     w, b = mmengine.load(args.fc)
     print(f'{w.shape=}, {b.shape=}')
@@ -300,7 +307,7 @@ def main():
         name: mmengine.load(feat)
         for name, feat in zip(ood_names, args.ood_features)
     }
-
+    #args.clip_quantile = 1 #only for wideresnet10
     clip_high = np.quantile(feature_id_train, args.clip_quantile)
     print(f'clip quantile high {args.clip_quantile}, clip {clip_high:.4f}')
 
@@ -318,6 +325,7 @@ def main():
 
     # ---------------------------------------
     # Introduced by Energy + VRA
+    feature_id_train_clip_VRA = np.clip(mmengine.load(args.id_train_feature), a_min=clip_low, a_max=clip_high)
     feature_id_val_clip_VRA = np.clip(mmengine.load(args.id_val_feature), a_min=clip_low, a_max=clip_high)
     feature_oods_clip_VRA = {
         name: np.clip(mmengine.load(feat), a_min=clip_low, a_max=clip_high)
@@ -410,6 +418,7 @@ def main():
     print(f'\n{method}')
     result = []
     score_id = softmax_id_val.max(axis=-1)
+
     for name, softmax_ood in softmax_oods.items():
         score_ood = softmax_ood.max(axis=-1)
         auc_ood = auc(score_id, score_ood)[0]
@@ -419,6 +428,11 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
@@ -435,6 +449,11 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
@@ -451,6 +470,11 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
@@ -468,6 +492,11 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
@@ -485,6 +514,11 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # --------------------------------------
@@ -508,6 +542,11 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
@@ -516,18 +555,16 @@ def main():
     result = []
     
     contrib = feature_mean[None, :] * w
-    thresh = np.percentile(contrib, 90)
+    thresh = np.percentile(contrib, 70)
     mask = (contrib > thresh)
     masked_w = w * mask
 
-    vote_id_val = feature_id_val[:, None, :] * masked_w  # Broadcasted multiplication (B, 1, C) * (F, C) -> (B, F, C)
-    output_id_val = np.sum(vote_id_val, axis=2) + b  # Summing along the last axis and adding fc_bias (B, F)
+    output_id_val = feature_id_val @ masked_w.T + b
     score_id = logsumexp(output_id_val, axis=-1)
 
     for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
                                             feature_oods.values()):
-        vote_ood = feature_ood[:, None, :] * masked_w  # Broadcasted multiplication (B, 1, C) * (F, C) -> (B, F, C)
-        output_ood = np.sum(vote_ood, axis=2) + b  # Summing along the last axis and adding fc_bias (B, F)
+        output_ood = feature_ood @ masked_w.T + b
         score_ood = logsumexp(output_ood, axis=-1)
 
         auc_ood = auc(score_id, score_ood)[0]
@@ -537,14 +574,18 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
     method = 'ASH'
     print(f'\n{method}')
     result = []
-    #refer to ash for hyperparameters p
-    percentile_ash = 95
+    percentile_ash = 90 
 
     feature_id_val_torch = torch.from_numpy(np.copy(feature_id_val))
     feature_id_val_torch = ash_s(feature_id_val_torch.view(feature_id_val_torch.size(0), -1, 1, 1), percentile_ash)
@@ -570,6 +611,11 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
@@ -580,21 +626,30 @@ def main():
     metric = 'inner_product'
     pred_labels_train = np.argmax(softmax_id_train, axis=-1)
 
+    if mapping is not None:
+        map_func = np.vectorize(lambda x: mapping.get(x, None))
+        pred_labels_train = map_func(pred_labels_train)
+
+
     activation_log = []
     for i in range(train_labels.max() + 1):
         mask = (train_labels == i) & (pred_labels_train == i)
         class_correct_activations = feature_id_train[mask]
-        activation_log.append(np.mean(class_correct_activations, axis=0))
+        activation_log.append(np.mean(class_correct_activations, axis=0)) #pred and train are discordant
 
     activation_log = np.stack(activation_log, axis=0)
-    #activation_log = torch.cat(self.activation_log).cuda()
-
-    score_id = she_distance(feature_id_val, activation_log[np.argmax(softmax_id_val, axis=-1)], metric)
+    if mapping is not None:
+        score_id = she_distance(feature_id_val, activation_log[map_func(np.argmax(softmax_id_val, axis=-1))], metric)
+    else:
+        score_id = she_distance(feature_id_val, activation_log[np.argmax(softmax_id_val, axis=-1)], metric)
 
 
     for name, softmax_ood, feature_ood in zip(ood_names, softmax_oods.values(),
                                             feature_oods.values()):
-        score_ood = she_distance(feature_ood, activation_log[np.argmax(softmax_ood, axis=-1)], metric)
+        if mapping is not None:
+            score_ood = she_distance(feature_ood, activation_log[map_func(np.argmax(softmax_ood, axis=-1))], metric)
+        else:
+            score_ood = she_distance(feature_ood, activation_log[np.argmax(softmax_ood, axis=-1)], metric)
         auc_ood = auc(score_id, score_ood)[0]
         fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
         result.append(
@@ -602,6 +657,11 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
@@ -609,8 +669,8 @@ def main():
     print(f'\n{method}')
     result = []
 
-    gamma_gen = 0.01
-    M_gen = 10
+    gamma_gen = 0.1
+    M_gen = 100
     score_id = generalized_entropy(softmax_id_val, gamma_gen, M_gen)
 
     for name, softmax_ood, feature_ood in zip(ood_names, softmax_oods.values(),
@@ -623,6 +683,11 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
@@ -658,6 +723,11 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
@@ -665,7 +735,7 @@ def main():
     print(f'\n{method}')
     result = []
     
-    percentile_scale = 85
+    percentile_scale = 85 #Imagenet
 
     feature_id_val_torch = torch.from_numpy(np.copy(feature_id_val))
     feature_id_val_torch = scale(feature_id_val_torch.view(feature_id_val_torch.size(0), -1, 1, 1), percentile_scale)
@@ -691,10 +761,15 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
-    method = 'FDBD'
+    method = 'fDBD'
     print(f'\n{method}')
     result = []
 
@@ -712,9 +787,13 @@ def main():
 
     for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
                                             feature_oods.values()):
+        start = time.perf_counter()
         nn_idx_ood = logit_ood.argmax(axis=-1)
         logits_ood_sub = np.abs(logit_ood - np.max(logit_ood, axis=-1, keepdims=True))
         score_ood = np.sum(logits_ood_sub / denominator_matrix[nn_idx_ood], axis=1) / np.linalg.norm(feature_ood - feature_mean, axis=1)
+        mid = time.perf_counter()
+        print(f"Latency of fDBD on {name}: {mid - start:.6f} seconds")
+
         auc_ood = auc(score_id, score_ood)[0]
         fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
         result.append(
@@ -722,10 +801,15 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
-    '''method = 'Residual'
+    method = 'Residual'
     print(f'\n{method}')
     result = []
 
@@ -740,6 +824,11 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
@@ -756,10 +845,15 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
-    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')'''
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
-    '''method = 'Mahalanobis' #to factorise if necessary
+    method = 'Mahalanobis' #to factorise if necessary
     print(f'\n{method}')
     result = []
 
@@ -795,10 +889,15 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
-    method = 'KL-Matching' #to factorise if necessary
+    method = 'KL-Matching' 
     print(f'\n{method}')
     result = []
 
@@ -822,38 +921,34 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
-    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')'''
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
-    '''method = 'PCA' #to factorise if necessary
+    method = 'PCA' #to factorise if necessary
     print(f'\n{method}')
     result = []
 
     feature_mean = np.mean(feature_id_train, axis=0)
 
-    threshold = np.quantile(feature_id_train, 0.92)
-    #threshold = 1.0
+    threshold_pca = np.quantile(feature_id_train, 0.92)
 
-    cov = np.cov(feature_id_train.T)
-    u_, s, v = np.linalg.svd(cov)
+    feature_id_val_clip_pca = np.clip(feature_id_val, a_min=None, a_max=threshold_pca)
 
-    k = 256
-
-    M = u_[:, :k] @ u_[:, :k].T
-    dim = M.shape[0]
-
-    feature_id_val_clip = np.clip(feature_id_val, a_min=None, a_max=threshold)
-
-    logit_id_val = feature_id_val.clip(min=None, max=threshold) @ w.T + b
+    logit_id_val = feature_id_val.clip(min=None, max=threshold_pca) @ w.T + b
     rec_norm = np.linalg.norm((feature_id_val - feature_mean) @ (np.identity(dim) - M), axis=-1)
-    r_id = rec_norm / np.linalg.norm(feature_id_val_clip, axis=-1)
+    r_id = rec_norm / np.linalg.norm(feature_id_val_clip_pca, axis=-1)
 
     score_id = logsumexp(logit_id_val, axis=-1) * (1.0 - r_id)
 
 
     for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
                                             feature_oods.values()):
-        feature_ood_clip = np.clip(feature_ood, a_min=None, a_max=threshold)
+        feature_ood_clip = np.clip(feature_ood, a_min=None, a_max=threshold_pca)
         logit_ood_clip = feature_ood_clip @ w.T + b
         rec_ood = np.linalg.norm((feature_ood_clip - feature_mean) @ (np.identity(dim) - M), axis=-1)
         r_ood = rec_ood / np.linalg.norm(feature_ood_clip, axis=-1)
@@ -865,19 +960,30 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
-    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')'''
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
+    print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
     # ---------------------------------------
-    method = 'Ours'
+    method = 'MME' #Combination of VRA + SCALE + PCA + NME (perso) + fDBD
     print(f'\n{method}')
     result = []
 
-    vlogit_id_val = norm(np.matmul(feature_id_val - u, NS), axis=-1) * alpha
+    percentile_scale = 90
 
-    rec_norm = np.linalg.norm((feature_id_val - feature_mean) @ (np.identity(dim) - M), axis=-1)
-    #s = (feature_id_val - feature_mean)
-    #t = (np.identity(dim) - M)
-    r_id = rec_norm / np.linalg.norm(feature_id_val, axis=-1)
+    feature_id_val_torch = torch.from_numpy(np.copy(feature_id_val))
+    feature_id_val_torch = scale(feature_id_val_torch.view(feature_id_val_torch.size(0), -1, 1, 1), percentile_scale)
+    feature_id_val_torch = feature_id_val_torch.view(feature_id_val_torch.size(0), -1)
+    feature_id_val_scale = feature_id_val_torch.cpu().detach().numpy()
+    logit_scale_id_val = feature_id_val_scale @ w.T + b
+
+    vlogit_id_val = norm(np.matmul(feature_id_val_clip_VRA - u, NS), axis=-1) * alpha
+
+    rec_norm = np.linalg.norm((feature_id_val_clip_VRA - feature_mean) @ (np.identity(dim) - M), axis=-1)
+    r_id = rec_norm / np.linalg.norm(feature_id_val_clip_VRA, axis=-1)
     
     vectors_id = (feature_id_val.T / (np.linalg.norm(feature_id_val.T, axis=0) + EPSILON)).T
 
@@ -886,41 +992,40 @@ def main():
 
     logit_id_val_clip = np.clip(feature_id_val, a_min=clip_low, a_max=clip_high) @ w.T + b
 
-    contrib = feature_mean[None, :] * w
-    thresh = np.percentile(contrib, 90)
-    mask = (contrib > thresh)
-    masked_w = w * mask
+    nn_idx_id_val = logit_id_val.argmax(axis=-1)
+    logits_id_val_sub = np.abs(logit_id_val_clip_VRA - np.max(logit_id_val_clip_VRA, axis=-1, keepdims=True))
+    fdbd_id = np.sum(logits_id_val_sub / denominator_matrix[nn_idx_id_val], axis=1) / np.linalg.norm(feature_id_val_clip_VRA - feature_mean, axis=1)
 
-    vote_id_val = feature_id_val[:, None, :] * masked_w  # Broadcasted multiplication (B, 1, C) * (F, C) -> (B, F, C)
-    output_id_val = np.sum(vote_id_val, axis=2) + b  # Summing along the last axis and adding fc_bias (B, F)
-    #score_id = logsumexp(output_id_val, axis=-1)
-
-    #score_id = calculate_confidence_score(logit_id_val_clip, distances_id, r_id, vlogit_id_val)
-    score_id = calculate_confidence_score(logit_id_val, logit_id_val_clip, distances_id, r_id, vlogit_id_val, mapping=mapping) #reference
-    #score_id = calculate_confidence_score(output_id_val, logit_id_val_clip, distances_id, r_id, vlogit_id_val, mapping=mapping)
+    score_id = mme(logit_scale_id_val, distances_id, r_id, vlogit_id_val, fdbd_id, mapping=mapping)
 
 
-    for name, logit_ood, feature_ood in zip(ood_names, logit_oods.values(),
-                                            feature_oods.values()):
+    for name, logit_ood, feature_ood_clip_VRA, feature_ood in zip(ood_names, logit_oods.values(),
+                                            feature_oods_clip_VRA.values(), feature_oods.values()):
+
+        feature_ood_torch = torch.from_numpy(np.copy(feature_ood))
+        feature_ood_torch = scale(feature_ood_torch.view(feature_ood_torch.size(0), -1, 1, 1), percentile_scale)
+        feature_ood_torch = feature_ood_torch.view(feature_ood_torch.size(0), -1)
+        feature_ood_scale = feature_ood_torch.cpu().detach().numpy()
+        logit_scale_ood = feature_ood_scale @ w.T + b
         
-        vlogit_ood = norm(np.matmul(feature_ood - u, NS), axis=-1) * alpha
+        vlogit_ood = norm(np.matmul(feature_ood_clip_VRA - u, NS), axis=-1) * alpha
 
-        rec_norm = np.linalg.norm((feature_ood - feature_mean) @ (np.identity(dim) - M), axis=-1)
-        r_ood = rec_norm / np.linalg.norm(feature_ood, axis=-1)
+        rec_norm = np.linalg.norm((feature_ood_clip_VRA - feature_mean) @ (np.identity(dim) - M), axis=-1)
+        r_ood = rec_norm / np.linalg.norm(feature_ood_clip_VRA, axis=-1)
 
         vectors_ood = (feature_ood.T / (np.linalg.norm(feature_ood.T, axis=0) + EPSILON)).T
 
         distances_ood = cdist(class_means, vectors_ood, "sqeuclidean")  # [nb_classes, N]
         distances_ood = distances_ood.T
 
-        logit_ood_clip = np.clip(feature_ood, a_min=clip_low, a_max=clip_high) @ w.T + b
-        #score_ood = calculate_confidence_score(logit_ood_clip, distances_ood, r_ood, vlogit_ood)
+        #logit_ood_clip = np.clip(feature_ood, a_min=clip_low, a_max=clip_high) @ w.T + b
+        logit_ood_clip = feature_ood_clip_VRA @ w.T + b
 
-        vote_ood = feature_ood[:, None, :] * masked_w  # Broadcasted multiplication (B, 1, C) * (F, C) -> (B, F, C)
-        output_ood = np.sum(vote_ood, axis=2) + b
+        nn_idx_ood = logit_ood.argmax(axis=-1)
+        logits_ood_sub = np.abs(logit_ood_clip - np.max(logit_ood_clip, axis=-1, keepdims=True))
+        fdbd_ood = np.sum(logits_ood_sub / denominator_matrix[nn_idx_ood], axis=1) / np.linalg.norm(feature_ood_clip_VRA - feature_mean, axis=1)
 
-        score_ood = calculate_confidence_score(logit_ood, logit_ood_clip, distances_ood, r_ood, vlogit_ood, mapping=mapping) # reference
-        #score_ood = calculate_confidence_score(output_ood, logit_ood_clip, distances_ood, r_ood, vlogit_ood, mapping=mapping)
+        score_ood = mme(logit_scale_ood, distances_ood, r_ood, vlogit_ood, fdbd_ood, mapping=mapping)
 
         auc_ood = auc(score_id, score_ood)[0]
         fpr_ood, _ = fpr_recall(score_id, score_ood, recall)
@@ -929,6 +1034,11 @@ def main():
         print(f'{method}: {name} auroc {auc_ood:.2%}, fpr {fpr_ood:.2%}')
     df = pd.DataFrame(result)
     dfs.append(df)
+
+    near_auroc, near_fpr, far_auroc, far_fpr = near_far_mean(result, list_near_ood, list_far_ood)
+
+    print(f"far mean auroc: {far_auroc:.2%}, far mean fpr: {far_fpr:.2%}")
+    print(f"near mean auroc: {near_auroc:.2%}, near mean fpr: {near_fpr:.2%}")
     print(f'mean auroc {df.auroc.mean():.2%}, {df.fpr.mean():.2%}')
 
 
