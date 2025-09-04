@@ -1,5 +1,5 @@
 ## Multi-Method Ensemble for Out-of-Distribution Detection
-The official implementation of our ACIVS 2025 paper:
+The official implementation of our BMVC 2025 paper:
 [Multi-Method Ensemble for Out-of-Distribution Detection](https://arxiv.org/abs/2508.21463).
 
 #### Abstract
