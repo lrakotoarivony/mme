@@ -95,6 +95,14 @@ cd ..
    
 ### Cite
 If you found this work useful in your research, please consider citing:
+```
+@article{rakotoarivony2025multi,
+  title={Multi-Method Ensemble for Out-of-Distribution Detection},
+  author={Rakotoarivony, Lucas},
+  journal={arXiv preprint arXiv:2508.21463},
+  year={2025}
+}
+```
 
 
 ### Acknowledgement
