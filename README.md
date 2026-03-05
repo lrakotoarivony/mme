@@ -1,6 +1,6 @@
 ## Multi-Method Ensemble for Out-of-Distribution Detection
 The official implementation of our BMVC 2025 paper:
-[Multi-Method Ensemble for Out-of-Distribution Detection](https://arxiv.org/abs/2508.21463).
+[Multi-Method Ensemble for Out-of-Distribution Detection](https://bmvc2025.bmva.org/proceedings/546/).
 
 #### Abstract
 *Detecting out-of-distribution (OOD) samples is essential for neural networks operating in open-world settings, particularly in safety-critical applications. Existing methods have improved OOD detection by leveraging two main techniques: feature truncation, which increases the separation between in-distribution (ID) and OOD samples, and scoring functions, which assign scores to distinguish between ID and OOD data. However, most approaches either focus on a single family of techniques or evaluate their effectiveness on a specific type of OOD dataset, overlooking the potential of combining multiple existing solutions. Motivated by this observation, we theoretically and empirically demonstrate that state-of-the-art feature truncation and scoring functions can be effectively combined. Moreover, we show that aggregating multiple scoring functions enhances robustness against various types of OOD samples. Based on these insights, we propose the Multi-Method Ensemble (MME) score, which unifies state-of-the-art OOD detectors into a single, more effective scoring function. Extensive experiments on both large-scale and small-scale benchmarks, covering near-OOD and far-OOD scenarios, show that MME significantly outperforms recent state-of-the-art methods across all benchmarks. Notably, using the BiT model, our method achieves an average FPR95 of 27.57% on the challenging ImageNet-1K benchmark, improving performance by 6% over the best existing baseline.*
@@ -96,11 +96,13 @@ cd ..
 ### Cite
 If you found this work useful in your research, please consider citing:
 ```
-@article{rakotoarivony2025multi,
-  title={Multi-Method Ensemble for Out-of-Distribution Detection},
-  author={Rakotoarivony, Lucas},
-  journal={arXiv preprint arXiv:2508.21463},
-  year={2025}
+@inproceedings{Rakotoarivony_2025_BMVC,
+author    = {Lucas Rakotoarivony},
+title     = {Multi-Method Ensemble for Out-of-Distribution Detection},
+booktitle = {36th British Machine Vision Conference 2025, {BMVC} 2025, Sheffield, UK, November 24-27, 2025},
+publisher = {BMVA},
+year      = {2025},
+url       = {https://bmva-archive.org.uk/bmvc/2025/assets/papers/Paper_546/paper.pdf}
 }
 ```
 
